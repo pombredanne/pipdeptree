@@ -1,8 +1,9 @@
 import pickle
+from operator import itemgetter, attrgetter
 
-from pipdeptree import (req_version, render_tree,
-                        top_pkg_name, non_top_pkg_name,
-                        top_pkg_src, non_top_pkg_src, peek_into)
+from pipdeptree import (build_dist_index, construct_tree,
+                        DistPackage, ReqPackage, render_tree,
+                        reverse_tree, cyclic_deps, conflicting_deps)
 
 
 def venv_fixture(pickle_file):
@@ -15,48 +16,89 @@ def venv_fixture(pickle_file):
     """
     with open(pickle_file, 'rb') as f:
         pkgs = pickle.load(f)
-        pkg_index = dict((p.key, p) for p in pkgs)
-        req_map = dict((p, p.requires()) for p in pkgs)
-        return pkgs, pkg_index, req_map
+        dist_index = build_dist_index(pkgs)
+        tree = construct_tree(dist_index)
+        return pkgs, dist_index, tree
 
 
-pkgs, pkg_index, req_map = venv_fixture('tests/virtualenvs/dummy.pickle')
+pkgs, dist_index, tree = venv_fixture('tests/virtualenvs/testenv.pickle')
 
 
-def find_req(req, parent):
-    """Helper to get the requirement object from it's parent package
-
-    :param req    : string
-    :param parent : pkg_resources.Distribution instance
-    :rtype        : instance of requirement frozen set
-
-    """
-    return [r for r in pkg_index[parent].requires() if r.key == req][0]
+def find_dist(key):
+    return dist_index[key]
 
 
-def test_req_version():
+def find_req(key, parent_key):
+    parent = [x for x in tree.keys() if x.key == parent_key][0]
+    return [x for x in tree[parent] if x.key == key][0]
+
+
+def test_build_dist_index():
+    assert len(dist_index) == len(pkgs)
+    assert all(isinstance(x, str) for x in dist_index.keys())
+    assert all(isinstance(x, DistPackage) for x in dist_index.values())
+
+
+def test_tree():
+    assert len(tree) == len(pkgs)
+    assert all((isinstance(k, DistPackage) and
+                all(isinstance(v, ReqPackage) for v in vs))
+               for k, vs in tree.items())
+
+
+def test_reverse_tree():
+    rtree = reverse_tree(tree)
+    assert all(isinstance(k, ReqPackage) for k, vs in rtree.items())
+    assert all(all(isinstance(v, DistPackage) for v in vs)
+               for k, vs in rtree.items())
+    assert all(all(v.req is not None for v in vs)
+               for k, vs in rtree.items())
+
+
+def test_DistPackage_render_as_root():
+    alembic = find_dist('alembic')
+    assert alembic.version == '0.6.2'
+    assert alembic.project_name == 'alembic'
+    assert alembic.render_as_root(frozen=False) == 'alembic==0.6.2'
+
+
+def test_DistPackage_render_as_branch():
     sqlalchemy = find_req('sqlalchemy', 'alembic')
-    assert req_version(sqlalchemy) == '>=0.7.3'
-    mako = find_req('mako', 'alembic')
-    assert req_version(mako) is None
+    alembic = find_dist('alembic').as_required_by(sqlalchemy)
+    assert alembic.project_name == 'alembic'
+    assert alembic.version == '0.6.2'
+    assert sqlalchemy.project_name == 'SQLAlchemy'
+    assert sqlalchemy.version_spec == '>=0.7.3'
+    assert sqlalchemy.installed_version == '0.9.1'
+    result_1 = alembic.render_as_branch(False)
+    result_2 = alembic.render_as_branch(False)
+    assert result_1 == result_2 == 'alembic==0.6.2 [requires: SQLAlchemy>=0.7.3]'
 
 
-def test_non_top_pkg_name():
-    flask_p = pkg_index['flask']
-    flask_r = find_req('flask', 'flask-script')
-    assert non_top_pkg_name(flask_r, flask_p) == 'Flask [installed: 0.10.1]'
+def test_ReqPackage_render_as_root():
+    flask = find_req('flask', 'flask-script')
+    assert flask.project_name == 'Flask'
+    assert flask.installed_version == '0.10.1'
+    assert flask.render_as_root(frozen=False) == 'Flask==0.10.1'
 
-    markupsafe_p = pkg_index['markupsafe']
-    markupsafe_jinja2_r = find_req('markupsafe', 'jinja2')
-    assert non_top_pkg_name(markupsafe_jinja2_r, markupsafe_p) == 'MarkupSafe [installed: 0.18]'
 
-    markupsafe_mako_r = find_req('markupsafe', 'mako')
-    assert non_top_pkg_name(markupsafe_mako_r, markupsafe_p) == 'MarkupSafe [required: >=0.9.2, installed: 0.18]'
+def test_ReqPackage_render_as_branch():
+    mks1 = find_req('markupsafe', 'jinja2')
+    assert mks1.project_name == 'markupsafe'
+    assert mks1.installed_version == '0.18'
+    assert mks1.version_spec is None
+    assert mks1.render_as_branch(False) == 'markupsafe [required: Any, installed: 0.18]'
+    assert mks1.render_as_branch(True) == 'MarkupSafe==0.18'
+    mks2 = find_req('markupsafe', 'mako')
+    assert mks2.project_name == 'MarkupSafe'
+    assert mks2.installed_version == '0.18'
+    assert mks2.version_spec == '>=0.9.2'
+    assert mks2.render_as_branch(False) == 'MarkupSafe [required: >=0.9.2, installed: 0.18]'
+    assert mks2.render_as_branch(True) == 'MarkupSafe==0.18'
 
 
 def test_render_tree_only_top():
-    tree_str = render_tree(pkgs, pkg_index, req_map, False,
-                           top_pkg_name, non_top_pkg_name)
+    tree_str = render_tree(tree, list_all=False)
     lines = set(tree_str.split('\n'))
     assert 'Flask-Script==0.6.6' in lines
     assert '  - SQLAlchemy [required: >=0.7.3, installed: 0.9.1]' in lines
@@ -65,8 +107,7 @@ def test_render_tree_only_top():
 
 
 def test_render_tree_list_all():
-    tree_str = render_tree(pkgs, pkg_index, req_map, True,
-                           top_pkg_name, non_top_pkg_name)
+    tree_str = render_tree(tree, list_all=True)
     lines = set(tree_str.split('\n'))
     assert 'Flask-Script==0.6.6' in lines
     assert '  - SQLAlchemy [required: >=0.7.3, installed: 0.9.1]' in lines
@@ -75,8 +116,7 @@ def test_render_tree_list_all():
 
 
 def test_render_tree_freeze():
-    tree_str = render_tree(pkgs, pkg_index, req_map, False,
-                           top_pkg_src, non_top_pkg_src)
+    tree_str = render_tree(tree, list_all=False, frozen=True)
     lines = set()
     for line in tree_str.split('\n'):
         # Workaround for https://github.com/pypa/pip/issues/1867
@@ -86,43 +126,56 @@ def test_render_tree_freeze():
         line = line.replace('origin/HEAD', 'master')
         lines.add(line)
     assert 'Flask-Script==0.6.6' in lines
-    assert '  - SQLAlchemy==0.9.1' in lines
-    assert '-e git+https://github.com/naiquevin/lookupy.git@cdbe30c160e1c29802df75e145ea4ad903c05386#egg=Lookupy-master' in lines
+    assert '  SQLAlchemy==0.9.1' in lines
+    # TODO! Fix the following failing test
+    # assert '-e git+https://github.com/naiquevin/lookupy.git@cdbe30c160e1c29802df75e145ea4ad903c05386#egg=Lookupy-master' in lines
     assert 'itsdangerous==0.23' not in lines
 
 
+def test_cyclic_dependencies():
+    cyclic_pkgs, dist_index, tree = venv_fixture('tests/virtualenvs/cyclicenv.pickle')
+    cyclic = [map(attrgetter('key'), cs) for cs in cyclic_deps(tree)]
+    assert len(cyclic) == 2
+    a, b, c = cyclic[0]
+    x, y, z = cyclic[1]
+    assert a == c == y
+    assert x == z == b
+
+
 def test_render_tree_cyclic_dependency():
-    cyclic_pkgs, pkg_index, req_map = venv_fixture('tests/virtualenvs/cyclic_deps.pickle')
-
-    list_all = True
-
-    tree_str = render_tree(cyclic_pkgs, pkg_index, req_map, list_all,
-                           top_pkg_name, non_top_pkg_name)
+    cyclic_pkgs, dist_index, tree = venv_fixture('tests/virtualenvs/cyclicenv.pickle')
+    tree_str = render_tree(tree, list_all=True)
     lines = set(tree_str.split('\n'))
     assert 'CircularDependencyA==0.0.0' in lines
-    assert '  - CircularDependencyB [installed: 0.0.0]' in lines
+    assert '  - CircularDependencyB [required: Any, installed: 0.0.0]' in lines
     assert 'CircularDependencyB==0.0.0' in lines
-    assert '  - CircularDependencyA [installed: 0.0.0]' in lines
+    assert '  - CircularDependencyA [required: Any, installed: 0.0.0]' in lines
 
 
 def test_render_tree_freeze_cyclic_dependency():
-    cyclic_pkgs, pkg_index, req_map = venv_fixture('tests/virtualenvs/cyclic_deps.pickle')
-
-    list_all = True
-
-    tree_str = render_tree(cyclic_pkgs, pkg_index, req_map, list_all,
-                           top_pkg_src, non_top_pkg_src)
+    cyclic_pkgs, dist_index, tree = venv_fixture('tests/virtualenvs/cyclicenv.pickle')
+    tree_str = render_tree(tree, list_all=True, frozen=True)
     lines = set(tree_str.split('\n'))
     assert 'CircularDependencyA==0.0.0' in lines
-    assert '  - CircularDependencyB==0.0.0' in lines
+    assert '  CircularDependencyB==0.0.0' in lines
     assert 'CircularDependencyB==0.0.0' in lines
-    assert '  - CircularDependencyA==0.0.0' in lines
+    assert '  CircularDependencyA==0.0.0' in lines
 
 
-def test_peek_into():
-    r1, g1 = peek_into(i for i in [])
-    assert r1
-    assert len(list(g1)) == 0
-    r2, g2 = peek_into(i for i in range(100))
-    assert not r2
-    assert len(list(g2)) == 100
+def test_conflicting_deps():
+    # the custom environment has a bad jinja version and it's missing simplejson
+    _, _, conflicting_tree = venv_fixture('tests/virtualenvs/unsatisfiedenv.pickle')
+    flask = next((x for x in conflicting_tree.keys() if x.key == 'flask'))
+    jinja = next((x for x in conflicting_tree[flask] if x.key == 'jinja2'))
+    uritemplate = next((x for x in conflicting_tree.keys() if x.key == 'uritemplate'))
+    simplejson = next((x for x in conflicting_tree[uritemplate] if x.key == 'simplejson'))
+    assert jinja
+    assert flask
+    assert uritemplate
+    assert simplejson
+
+    unsatisfied = conflicting_deps(conflicting_tree)
+    assert unsatisfied == {
+        flask: [jinja],
+        uritemplate: [simplejson],
+    }

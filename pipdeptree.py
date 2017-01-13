@@ -1,214 +1,436 @@
 from __future__ import print_function
 import sys
-from itertools import chain, tee
+from itertools import chain
 from collections import defaultdict
 import argparse
+from operator import attrgetter
+import json
+from importlib import import_module
+
+try:
+    from collections import OrderedDict
+except ImportError:
+    from ordereddict import OrderedDict
 
 import pip
+import pkg_resources
+# inline:
+# from graphviz import backend, Digraph
+
+
+__version__ = '0.9.0'
 
 
 flatten = chain.from_iterable
 
 
-def req_version(req):
-    """Builds the version string for the requirement instance
+def build_dist_index(pkgs):
+    """Build an index pkgs by their key as a dict.
 
-    :param req: requirement object
-    :returns: the version in desired format
-    :rtype: string or NoneType
+    :param list pkgs: list of pkg_resources.Distribution instances
+    :returns: index of the pkgs by the pkg key
+    :rtype: dict
 
     """
-    return ''.join(req.specs[0]) if req.specs else None
+    return dict((p.key, DistPackage(p)) for p in pkgs)
 
 
-def top_pkg_name(pkg):
-    """Builds the package name for top level package
+def construct_tree(index):
+    """Construct tree representation of the pkgs from the index.
 
-    This just prints the name and the version of the package which may
-    not necessarily match with the output of `pip freeze` which also
-    includes info such as VCS source for editable packages
+    The keys of the dict representing the tree will be objects of type
+    DistPackage and the values will be list of ReqPackage objects.
 
-    :param pkg: pkg_resources.Distribution
-    :returns: the package name and version in the desired format
+    :param dict index: dist index ie. index of pkgs by their keys
+    :returns: tree of pkgs and their dependencies
+    :rtype: dict
+
+    """
+    return dict((p, [ReqPackage(r, index.get(r.key))
+                     for r in p.requires()])
+                for p in index.values())
+
+
+def sorted_tree(tree):
+    """Sorts the dict representation of the tree
+
+    The root packages as well as the intermediate packages are sorted
+    in the alphabetical order of the package names.
+
+    :param dict tree: the pkg dependency tree obtained by calling
+                     `construct_tree` function
+    :returns: sorted tree
+    :rtype: collections.OrderedDict
+
+    """
+    return OrderedDict(sorted([(k, sorted(v, key=attrgetter('key')))
+                               for k, v in tree.items()],
+                              key=lambda kv: kv[0].key))
+
+
+def find_tree_root(tree, key):
+    """Find a root in a tree by it's key
+
+    :param dict tree: the pkg dependency tree obtained by calling
+                     `construct_tree` function
+    :param str key: key of the root node to find
+    :returns: a root node if found else None
+    :rtype: mixed
+
+    """
+    result = [p for p in tree.keys() if p.key == key]
+    assert len(result) in [0, 1]
+    return None if len(result) == 0 else result[0]
+
+
+def reverse_tree(tree):
+    """Reverse the dependency tree.
+
+    ie. the keys of the resulting dict are objects of type
+    ReqPackage and the values are lists of DistPackage objects.
+
+    :param dict tree: the pkg dependency tree obtained by calling
+                      `construct_tree` function
+    :returns: reversed tree
+    :rtype: dict
+
+    """
+    rtree = defaultdict(list)
+    child_keys = set(c.key for c in flatten(tree.values()))
+    for k, vs in tree.items():
+        for v in vs:
+            node = find_tree_root(rtree, v.key) or v
+            rtree[node].append(k.as_required_by(v))
+        if k.key not in child_keys:
+            rtree[k.as_requirement()] = []
+    return rtree
+
+
+def guess_version(pkg_key, default='?'):
+    """Guess the version of a pkg when pip doesn't provide it
+
+    :param str pkg_key: key of the package
+    :param str default: default version to return if unable to find
+    :returns: version
     :rtype: string
 
     """
-    return '{0}=={1}'.format(pkg.project_name, pkg.version)
+    try:
+        m = import_module(pkg_key)
+    except ImportError:
+        return default
+    else:
+        return getattr(m, '__version__', default)
 
 
-def non_top_pkg_name(req, pkg):
-    """Builds the package name for a non-top level package
+class Package(object):
+    """Abstract class for wrappers around objects that pip returns.
 
-    For the dependencies of the top level packages, the installed
-    version as well as the version required by it's parent package
-    will be specified with it's name
-
-    :param req: requirements instance
-    :param pkg: pkg_resources.Distribution
-    :returns: the package name and version in the desired format
-    :rtype: string
-
-    """
-    vers = []
-    req_ver = req_version(req)
-    if req_ver:
-        vers.append(('required', req_ver))
-    if pkg:
-        vers.append(('installed', pkg.version))
-    if not vers:
-        return req.key
-    ver_str = ', '.join(['{0}: {1}'.format(k, v) for k, v in vers])
-    return '{0} [{1}]'.format(pkg.project_name, ver_str)
-
-
-def top_pkg_src(pkg):
-    """Returns the frozen package name
-
-    The may or may not be the same as the package name.
-
-    :param pkg: pkg_resources.Distribution
-    :returns: frozen name of the package
-    :rtype: string
+    This class needs to be subclassed with implementations for
+    `render_as_root` and `render_as_branch` methods.
 
     """
-    return str(pip.FrozenRequirement.from_dist(pkg, [])).strip()
+
+    def __init__(self, obj):
+        self._obj = obj
+        self.project_name = obj.project_name
+        self.key = obj.key
+
+    def render_as_root(self, frozen):
+        return NotImplementedError
+
+    def render_as_branch(self, frozen):
+        return NotImplementedError
+
+    def render(self, parent=None, frozen=False):
+        if not parent:
+            return self.render_as_root(frozen)
+        else:
+            return self.render_as_branch(frozen)
+
+    @staticmethod
+    def frozen_repr(obj):
+        fr = pip.FrozenRequirement.from_dist(obj, [])
+        return str(fr).strip()
+
+    def __getattr__(self, key):
+        return getattr(self._obj, key)
+
+    def __repr__(self):
+        return '<{0}("{1}")>'.format(self.__class__.__name__, self.key)
 
 
-def non_top_pkg_src(_req, pkg):
-    """Returns frozen package name for non top level package
+class DistPackage(Package):
+    """Wrapper class for pkg_resources.Distribution instances
 
-    :param _req: the requirements instance
-    :param pkg: pkg_resources.Distribution
-    :returns: frozen name of the package
-    :rtype: string
-
+      :param obj: pkg_resources.Distribution to wrap over
+      :param req: optional ReqPackage object to associate this
+                  DistPackage with. This is useful for displaying the
+                  tree in reverse
     """
-    return top_pkg_src(pkg)
+
+    def __init__(self, obj, req=None):
+        super(DistPackage, self).__init__(obj)
+        self.version_spec = None
+        self.req = req
+
+    def render_as_root(self, frozen):
+        if not frozen:
+            return '{0}=={1}'.format(self.project_name, self.version)
+        else:
+            return self.__class__.frozen_repr(self._obj)
+
+    def render_as_branch(self, frozen):
+        assert self.req is not None
+        if not frozen:
+            parent_ver_spec = self.req.version_spec
+            parent_str = self.req.project_name
+            if parent_ver_spec:
+                parent_str += parent_ver_spec
+            return (
+                '{0}=={1} [requires: {2}]'
+            ).format(self.project_name, self.version, parent_str)
+        else:
+            return self.render_as_root(frozen)
+
+    def as_requirement(self):
+        """Return a ReqPackage representation of this DistPackage"""
+        return ReqPackage(self._obj.as_requirement(), dist=self)
+
+    def as_required_by(self, req):
+        """Return a DistPackage instance associated to a requirement
+
+        This association is necessary for displaying the tree in
+        reverse.
+
+        :param ReqPackage req: the requirement to associate with
+        :returns: DistPackage instance
+
+        """
+        return self.__class__(self._obj, req)
+
+    def as_dict(self):
+        return {'key': self.key,
+                'package_name': self.project_name,
+                'installed_version': self.version}
 
 
-def has_multi_versions(reqs):
-    vers = (req_version(r) for r in reqs)
-    return len(set(vers)) > 1
+class ReqPackage(Package):
+    """Wrapper class for Requirements instance
 
-
-def confusing_deps(req_map):
-    """Returns group of dependencies that are possibly confusing
-
-    eg. if pkg1 requires pkg3>=1.0 and pkg2 requires pkg3>=1.0,<=2.0
-
-    :param dict req_map: mapping of pkgs with the list of their deps
-    :returns: groups of dependencies paired with their top level pkgs
-    :rtype: list of list of pairs
-
+      :param obj: The `Requirements` instance to wrap over
+      :param dist: optional `pkg_resources.Distribution` instance for
+                   this requirement
     """
-    deps = defaultdict(list)
-    for p, rs in req_map.items():
-        for r in rs:
-            deps[r.key].append((p, r))
-    return [ps for r, ps in deps.items()
-            if len(ps) > 1
-            and has_multi_versions(d for p, d in ps)]
+
+    UNKNOWN_VERSION = '?'
+
+    def __init__(self, obj, dist=None):
+        super(ReqPackage, self).__init__(obj)
+        self.dist = dist
+
+    @property
+    def version_spec(self):
+        specs = self._obj.specs
+        return ','.join([''.join(sp) for sp in specs]) if specs else None
+
+    @property
+    def installed_version(self):
+        if not self.dist:
+            return guess_version(self.key, self.UNKNOWN_VERSION)
+        return self.dist.version
+
+    def is_conflicting(self):
+        """If installed version conflicts with required version"""
+        # unknown installed version is also considered conflicting
+        if self.installed_version == self.UNKNOWN_VERSION:
+            return True
+        ver_spec = (self.version_spec if self.version_spec else '')
+        req_version_str = '{0}{1}'.format(self.project_name, ver_spec)
+        req_obj = pkg_resources.Requirement.parse(req_version_str)
+        return self.installed_version not in req_obj
+
+    def render_as_root(self, frozen):
+        if not frozen:
+            return '{0}=={1}'.format(self.project_name, self.installed_version)
+        elif self.dist:
+            return self.__class__.frozen_repr(self.dist._obj)
+        else:
+            return self.project_name
+
+    def render_as_branch(self, frozen):
+        if not frozen:
+            req_ver = self.version_spec if self.version_spec else 'Any'
+            return (
+                '{0} [required: {1}, installed: {2}]'
+                ).format(self.project_name, req_ver, self.installed_version)
+        else:
+            return self.render_as_root(frozen)
+
+    def as_dict(self):
+        return {'key': self.key,
+                'package_name': self.project_name,
+                'installed_version': self.installed_version,
+                'required_version': self.version_spec}
 
 
-def render_tree(pkgs, pkg_index, req_map, list_all,
-                top_pkg_str, non_top_pkg_str):
-    """Renders a package dependency tree as a string
+def render_tree(tree, list_all=True, show_only=None, frozen=False):
+    """Convert to tree to string representation
 
-    :param list pkgs: pkg_resources.Distribution instances
-    :param dict pkg_index: mapping of pkgs with their respective keys
-    :param dict req_map: mapping of pkgs with the list of their deps
-    :param bool list_all: whether to show globally installed pkgs
-                          if inside a virtualenv with global access
-    :param function top_pkg_str: function to render a top level
-                                 package as string
-    :param function non_top_pkg_str: function to render a non-top
-                                     level package as string
-    :returns: dependency tree encoded as string
+    :param dict tree: the package tree
+    :param bool list_all: whether to list all the pgks at the root
+                          level or only those that are the
+                          sub-dependencies
+    :param set show_only: set of select packages to be shown in the
+                          output. This is optional arg, default: None.
+    :param bool frozen: whether or not show the names of the pkgs in
+                        the output that's favourable to pip --freeze
+    :returns: string representation of the tree
     :rtype: str
 
     """
-    non_top = set(r.key for r in flatten(req_map.values()))
-    top = [p for p in pkgs if p.key not in non_top]
+    tree = sorted_tree(tree)
+    branch_keys = set(r.key for r in flatten(tree.values()))
+    nodes = tree.keys()
+    use_bullets = not frozen
 
-    def aux(pkg, indent=0, chain=None):
+    key_tree = dict((k.key, v) for k, v in tree.items())
+    get_children = lambda n: key_tree.get(n.key, [])
+
+    if show_only:
+        nodes = [p for p in nodes
+                 if p.key in show_only or p.project_name in show_only]
+    elif not list_all:
+        nodes = [p for p in nodes if p.key not in branch_keys]
+
+    def aux(node, parent=None, indent=0, chain=None):
         if chain is None:
-            chain = [pkg.project_name]
-
-        # In this function, pkg can either be a Distribution or
-        # Requirement instance
-        if indent > 0:
-            # this is definitely a Requirement (due to positive
-            # indent) so we need to find the Distribution instance for
-            # it from the pkg_index
-            dist = pkg_index.get(pkg.key)
-            # FixMe! Some dependencies are not present in the result of
-            # `pip.get_installed_distributions`
-            # eg. `testresources`. This is a hack around it.
-            name = pkg.project_name if dist is None else non_top_pkg_str(pkg, dist)
-            result = [' '*indent+'- '+name]
-        else:
-            result = [top_pkg_str(pkg)]
-
-        # FixMe! in case of some pkg not present in list of all
-        # packages, eg. `testresources`, this will fail
-        if pkg.key in pkg_index:
-            pkg_deps = pkg_index[pkg.key].requires()
-            filtered_deps = [
-                aux(d, indent=indent+2, chain=chain+[d.project_name])
-                for d in pkg_deps
-                if d.project_name not in chain]
-            result += list(flatten(filtered_deps))
+            chain = [node.project_name]
+        node_str = node.render(parent, frozen)
+        if parent:
+            prefix = ' '*indent + ('- ' if use_bullets else '')
+            node_str = prefix + node_str
+        result = [node_str]
+        children = [aux(c, node, indent=indent+2,
+                        chain=chain+[c.project_name])
+                    for c in get_children(node)
+                    if c.project_name not in chain]
+        result += list(flatten(children))
         return result
 
-    lines = flatten([aux(p) for p in (pkgs if list_all else top)])
+    lines = flatten([aux(p) for p in nodes])
     return '\n'.join(lines)
 
 
-def cyclic_deps(pkgs, pkg_index):
-    """Generator that produces cyclic dependencies
+def jsonify_tree(tree, indent):
+    """Converts the tree into json representation.
+
+    The json repr will be a list of hashes, each hash having 2 fields:
+      - package
+      - dependencies: list of dependencies
+
+    :param dict tree: dependency tree
+    :param int indent: no. of spaces to indent json
+    :returns: json representation of the tree
+    :rtype: str
+
+    """
+    return json.dumps([{'package': k.as_dict(),
+                        'dependencies': [v.as_dict() for v in vs]}
+                       for k, vs in tree.items()],
+                      indent=indent)
+
+
+def dump_graphviz(tree, output_format='dot'):
+    """Output dependency graph as one of the supported GraphViz output formats.
+
+    :param dict tree: dependency graph
+    :param string output_format: output format
+    :returns: representation of tree in the specified output format
+    :rtype: str or binary representation depending on the output format
+
+    """
+    try:
+        from graphviz import backend, Digraph
+    except ImportError:
+        print('graphviz is not available, but necessary for the output '
+              'option. Please install it.', file=sys.stderr)
+        sys.exit(1)
+
+    if output_format not in backend.FORMATS:
+        print('{} is no supported output format.'.format(output_format),
+              file=sys.stderr)
+        print('Supported formats are: {}'.format(
+            ', '.join(sorted(backend.FORMATS))), file=sys.stderr)
+        sys.exit(1)
+
+    graph = Digraph(format=output_format)
+    for package, deps in tree.items():
+        project_name = package.project_name
+        label = '{}\n{}'.format(project_name, package.version)
+        graph.node(project_name, label=label)
+        for dep in deps:
+            label = dep.version_spec
+            if not label:
+                label = 'any'
+            graph.edge(project_name, dep.project_name, label=label)
+
+    # Allow output of dot format, even if GraphViz isn't installed.
+    if output_format == 'dot':
+        return graph.source
+
+    # As it's unknown if the selected output format is binary or not, try to
+    # decode it as UTF8 and only print it out in binary if that's not possible.
+    try:
+        return graph.pipe().decode('utf-8')
+    except UnicodeDecodeError:
+        return graph.pipe()
+
+
+def conflicting_deps(tree):
+    """Returns dependencies which are not present or conflict with the
+    requirements of other packages.
+
+    e.g. will warn if pkg1 requires pkg2==2.0 and pkg2==1.0 is installed
+
+    :param tree: the requirements tree (dict)
+    :returns: dict of DistPackage -> list of unsatisfied/unknown ReqPackage
+    :rtype: dict
+
+    """
+    conflicting = defaultdict(list)
+    for p, rs in tree.items():
+        for req in rs:
+            if req.is_conflicting():
+                conflicting[p].append(req)
+    return conflicting
+
+
+def cyclic_deps(tree):
+    """Return cyclic dependencies as list of tuples
 
     :param list pkgs: pkg_resources.Distribution instances
     :param dict pkg_index: mapping of pkgs with their respective keys
-    :returns: generator that yields str representation of cyclic
-              dependencies
+    :returns: list of tuples representing cyclic dependencies
     :rtype: generator
 
     """
-    def aux(pkg, chain):
-        if pkg.key in pkg_index:
-            for d in pkg_index[pkg.key].requires():
-                if d.project_name in chain:
-                    yield ' => '.join([str(p) for p in chain] + [str(d)])
-                else:
-                    for cycle in aux(d, chain=chain+[d.project_name]):
-                        yield cycle
-
-    for cycle in flatten([aux(p, chain=[]) for p in pkgs]):
-        yield cycle
+    key_tree = dict((k.key, v) for k, v in tree.items())
+    get_children = lambda n: key_tree.get(n.key, [])
+    cyclic = []
+    for p, rs in tree.items():
+        for req in rs:
+            if p.key in map(attrgetter('key'), get_children(req)):
+                cyclic.append((p, req, p))
+    return cyclic
 
 
-def peek_into(iterator):
-    """Peeks into an iterator to check if it's empty
-
-    :param iterator: an iterator
-    :returns: tuple of boolean representing whether the iterator is
-              empty or not and the iterator itself.
-    :rtype: tuple
-
-    """
-    a, b = tee(iterator)
-    is_empty = False
-    try:
-        next(a)
-    except StopIteration:
-        is_empty = True
-    return is_empty, b
-
-
-def main():
+def get_parser():
     parser = argparse.ArgumentParser(description=(
         'Dependency tree of the installed python packages'
     ))
+    parser.add_argument('-v', '--version', action='version',
+                        version='{0}'.format(__version__))
     parser.add_argument('-f', '--freeze', action='store_true',
                         help='Print names so as to write freeze files')
     parser.add_argument('-a', '--all', action='store_true',
@@ -216,59 +438,103 @@ def main():
     parser.add_argument('-l', '--local-only',
                         action='store_true', help=(
                             'If in a virtualenv that has global access '
-                            'donot show globally installed packages'
+                            'do not show globally installed packages'
                         ))
-    parser.add_argument('-w', '--nowarn', action='store_true',
+    parser.add_argument('-u', '--user-only', action='store_true',
                         help=(
-                            'Inhibit warnings about possibly '
-                            'confusing packages'
+                            'Only show installations in the user site dir'
                         ))
+    parser.add_argument('-w', '--warn', action='store', dest='warn',
+                        nargs='?', default='suppress',
+                        choices=('silence', 'suppress', 'fail'),
+                        help=(
+                            'Warning control. "suppress" will show warnings '
+                            'but return 0 whether or not they are present. '
+                            '"silence" will not show warnings at all and '
+                            'always return 0. "fail" will show warnings and '
+                            'return 1 if any are present. The default is '
+                            '"suppress".'
+                        ))
+    parser.add_argument('-r', '--reverse', action='store_true',
+                        default=False, help=(
+                            'Shows the dependency tree in the reverse fashion '
+                            'ie. the sub-dependencies are listed with the '
+                            'list of packages that need them under them.'
+                        ))
+    parser.add_argument('-p', '--packages',
+                        help=(
+                            'Comma separated list of select packages to show '
+                            'in the output. If set, --all will be ignored.'
+                        ))
+    parser.add_argument('-j', '--json', action='store_true', default=False,
+                        help=(
+                            'Display dependency tree as json. This will yield '
+                            '"raw" output that may be used by external tools. '
+                            'This option overrides all other options.'
+                        ))
+    parser.add_argument('--graph-output', dest='output_format',
+                        help=(
+                            'Print a dependency graph in the specified output '
+                            'format. Available are all formats supported by '
+                            'GraphViz, e.g.: dot, jpeg, pdf, png, svg'
+                        ))
+    return parser
+
+
+def main():
+    parser = get_parser()
     args = parser.parse_args()
 
-    default_skip = ['setuptools', 'pip', 'python', 'distribute']
-    skip = default_skip + ['pipdeptree']
     pkgs = pip.get_installed_distributions(local_only=args.local_only,
-                                           skip=skip)
+                                           user_only=args.user_only)
 
-    pkg_index = dict((p.key, p) for p in pkgs)
-    req_map = dict((p, p.requires()) for p in pkgs)
+    dist_index = build_dist_index(pkgs)
+    tree = construct_tree(dist_index)
 
-    # show warnings about possibly confusing deps if found and
+    if args.json:
+        print(jsonify_tree(tree, indent=4))
+        return 0
+    elif args.output_format:
+        print(dump_graphviz(tree, output_format=args.output_format))
+        return 0
+
+    return_code = 0
+
+    # show warnings about possibly conflicting deps if found and
     # warnings are enabled
-    if not args.nowarn:
-        confusing = confusing_deps(req_map)
-        if confusing:
-            print('Warning!!! Possible confusing dependencies found:', file=sys.stderr)
-            for xs in confusing:
-                for i, (p, d) in enumerate(xs):
-                    if d.key in skip:
-                        continue
-                    pkg = top_pkg_name(p)
-                    req = non_top_pkg_name(d, pkg_index[d.key])
-                    tmpl = '  {0} -> {1}' if i > 0 else '* {0} -> {1}'
-                    print(tmpl.format(pkg, req), file=sys.stderr)
+    if args.warn != 'silence':
+        conflicting = conflicting_deps(tree)
+        if conflicting:
+            print('Warning!!! Possibly conflicting dependencies found:',
+                  file=sys.stderr)
+            for p, reqs in conflicting.items():
+                pkg = p.render_as_root(False)
+                print('* {}'.format(pkg), file=sys.stderr)
+                for req in reqs:
+                    req_str = req.render_as_branch(False)
+                    print(' - {}'.format(req_str), file=sys.stderr)
             print('-'*72, file=sys.stderr)
 
-        is_empty, cyclic = peek_into(cyclic_deps(pkgs, pkg_index))
-        if not is_empty:
-            print('Warning!!! Cyclic dependencies found:', file=sys.stderr)
-            for xs in cyclic:
-                print('- {0}'.format(xs), file=sys.stderr)
+        cyclic = cyclic_deps(tree)
+        if cyclic:
+            print('Warning!! Cyclic dependencies found:', file=sys.stderr)
+            for a, b, c in cyclic:
+                print('* {0} => {1} => {2}'.format(a.project_name,
+                                                   b.project_name,
+                                                   c.project_name),
+                      file=sys.stderr)
             print('-'*72, file=sys.stderr)
 
-    if args.freeze:
-        top_pkg_str, non_top_pkg_str = top_pkg_src, non_top_pkg_src
-    else:
-        top_pkg_str, non_top_pkg_str = top_pkg_name, non_top_pkg_name
+        if args.warn == 'fail' and (conflicting or cyclic):
+            return_code = 1
 
-    tree = render_tree(pkgs,
-                       pkg_index=pkg_index,
-                       req_map=req_map,
-                       list_all=args.all,
-                       top_pkg_str=top_pkg_str,
-                       non_top_pkg_str=non_top_pkg_str)
+    show_only = set(args.packages.split(',')) if args.packages else None
+
+    tree = render_tree(tree if not args.reverse else reverse_tree(tree),
+                       list_all=args.all, show_only=show_only,
+                       frozen=args.freeze)
     print(tree)
-    return 0
+    return return_code
 
 
 if __name__ == '__main__':

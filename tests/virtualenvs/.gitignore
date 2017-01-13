@@ -1,0 +1,4 @@
+*.pickle
+testenv/
+cyclicenv/
+unsatisfiedenv/
