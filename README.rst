@@ -26,6 +26,11 @@ Installation
 
     $ pip install pipdeptree
 
+This will install the latest version of ``pipdeptree`` which requires
+at least Python 2.7. Prior to version ``0.10.0``, Python 2.6 was also
+supported, so in case you are still stuck with 2.6, please install
+``0.9.0``.
+
 
 Usage and examples
 ------------------
@@ -163,7 +168,7 @@ by grep-ing only the top-level lines from the output,
 
 There is a problem here though. The output doesn't mention anything
 about ``Lookupy`` being installed as an editable package (refer to the
-output of ``pip freeze`` above) and information about it's source is
+output of ``pip freeze`` above) and information about its source is
 lost. To fix this, ``pipdeptree`` must be run with a ``-f`` or
 ``--freeze`` flag.
 
@@ -203,7 +208,7 @@ tools.
     $ python pipdeptree.py --json
 
 The dependency graph can be layed out as any of the formats supported by
-GraphViz`GraphViz<http://www.graphviz.org/>`_:
+`GraphViz <http://www.graphviz.org/>`_:
 
 .. code-block:: bash
 
@@ -278,7 +283,7 @@ Tests can be run against all version of python using `tox
 
     $ make test-tox
 
-This assumes that you have python versions 2.6, 2.7, 3.2, 3.3 and 3.4
+This assumes that you have python versions 2.7, 3.3 and 3.4, 3.5, 3.6
 installed on your machine. (See more: tox.ini)
 
 Or if you don't want to install all the versions of python but want to
@@ -314,4 +319,4 @@ Release checklist
 License
 -------
 
-MIT (See LICENSE)
+MIT (See `LICENSE <./LICENSE>`_)
