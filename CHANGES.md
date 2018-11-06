@@ -1,6 +1,45 @@
 Changelog
 =========
 
+0.13.1
+------
+
+* Fixed import after changes in pip._internal introduced in pip
+  version 18.1
+
+0.13.0
+------
+
+* Added `--exclude` option to exclude packages specified as CSV
+
+* In case of multiple version specs eg. <x,>=y, fix the order to
+  ensure consistent output. The sorting is naive - puts the '>' prior
+  to '<', and '!'.
+
+* [Developer affecting] Updated dependencies in test environments, thereby
+  fixing the long standing issue of inconsistent test behaviour.
+
+
+0.12.1
+------
+
+* Fix import of 'FrozenRequirement' for pip 10.0.0
+
+
+0.12.0
+------
+
+* Changes to make pipdeptree work with pip 10.0.0. This change is
+  backward compatible.
+
+0.11.0
+------
+
+* Added support for nested json output (`--json-tree` flag). Behaviour
+  of `--json` stays the same.
+
+* Test environments have been updated to fix the builds.
+
 0.10.1
 ------
 

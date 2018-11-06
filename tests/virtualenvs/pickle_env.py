@@ -6,13 +6,16 @@
 import pickle
 import sys
 
-import pip
+try:
+    from pip._internal.utils.misc import get_installed_distributions
+except ImportError:
+    from pip import get_installed_distributions
 
 
 def main():
     default_skip = ['setuptools', 'pip', 'python', 'distribute']
     skip = default_skip + ['pipdeptree']
-    pkgs = pip.get_installed_distributions(local_only=True, skip=skip)
+    pkgs = get_installed_distributions(local_only=True, skip=skip)
     pickle.dump(pkgs, sys.stdout)
     return 0
 

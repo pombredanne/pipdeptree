@@ -6,11 +6,13 @@ from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
 from operator import attrgetter
 
+import pytest
+
 from pipdeptree import (build_dist_index, construct_tree,
                         DistPackage, ReqPackage, render_tree,
                         reverse_tree, cyclic_deps, conflicting_deps,
-                        get_parser, jsonify_tree, dump_graphviz,
-                        print_graphviz)
+                        get_parser, render_json, render_json_tree,
+                        dump_graphviz, print_graphviz, main)
 
 
 def venv_fixture(pickle_file):
@@ -64,62 +66,111 @@ def test_reverse_tree():
 
 def test_DistPackage_render_as_root():
     alembic = find_dist('alembic')
-    assert alembic.version == '0.6.2'
+    assert alembic.version == '0.9.10'
     assert alembic.project_name == 'alembic'
-    assert alembic.render_as_root(frozen=False) == 'alembic==0.6.2'
+    assert alembic.render_as_root(frozen=False) == 'alembic==0.9.10'
 
 
 def test_DistPackage_render_as_branch():
     sqlalchemy = find_req('sqlalchemy', 'alembic')
     alembic = find_dist('alembic').as_required_by(sqlalchemy)
     assert alembic.project_name == 'alembic'
-    assert alembic.version == '0.6.2'
+    assert alembic.version == '0.9.10'
     assert sqlalchemy.project_name == 'SQLAlchemy'
-    assert sqlalchemy.version_spec == '>=0.7.3'
-    assert sqlalchemy.installed_version == '0.9.1'
+    assert sqlalchemy.version_spec == '>=0.7.6'
+    assert sqlalchemy.installed_version == '1.2.9'
     result_1 = alembic.render_as_branch(False)
     result_2 = alembic.render_as_branch(False)
-    assert result_1 == result_2 == 'alembic==0.6.2 [requires: SQLAlchemy>=0.7.3]'
+    assert result_1 == result_2 == 'alembic==0.9.10 [requires: SQLAlchemy>=0.7.6]'
 
 
 def test_ReqPackage_render_as_root():
     flask = find_req('flask', 'flask-script')
     assert flask.project_name == 'Flask'
-    assert flask.installed_version == '0.10.1'
-    assert flask.render_as_root(frozen=False) == 'Flask==0.10.1'
+    assert flask.installed_version == '1.0.2'
+    assert flask.render_as_root(frozen=False) == 'Flask==1.0.2'
 
 
 def test_ReqPackage_render_as_branch():
     mks1 = find_req('markupsafe', 'jinja2')
-    assert mks1.project_name == 'markupsafe'
-    assert mks1.installed_version == '0.18'
-    assert mks1.version_spec is None
-    assert mks1.render_as_branch(False) == 'markupsafe [required: Any, installed: 0.18]'
-    assert mks1.render_as_branch(True) == 'MarkupSafe==0.18'
+    assert mks1.project_name == 'MarkupSafe'
+    assert mks1.installed_version == '1.0'
+    assert mks1.version_spec == '>=0.23'
+    assert mks1.render_as_branch(False) == 'MarkupSafe [required: >=0.23, installed: 1.0]'
+    assert mks1.render_as_branch(True) == 'MarkupSafe==1.0'
     mks2 = find_req('markupsafe', 'mako')
     assert mks2.project_name == 'MarkupSafe'
-    assert mks2.installed_version == '0.18'
+    assert mks2.installed_version == '1.0'
     assert mks2.version_spec == '>=0.9.2'
-    assert mks2.render_as_branch(False) == 'MarkupSafe [required: >=0.9.2, installed: 0.18]'
-    assert mks2.render_as_branch(True) == 'MarkupSafe==0.18'
+    assert mks2.render_as_branch(False) == 'MarkupSafe [required: >=0.9.2, installed: 1.0]'
+    assert mks2.render_as_branch(True) == 'MarkupSafe==1.0'
 
 
 def test_render_tree_only_top():
     tree_str = render_tree(tree, list_all=False)
     lines = set(tree_str.split('\n'))
-    assert 'Flask-Script==0.6.6' in lines
-    assert '  - SQLAlchemy [required: >=0.7.3, installed: 0.9.1]' in lines
+    assert 'Flask-Script==2.0.6' in lines
+    assert '  - SQLAlchemy [required: >=0.7.6, installed: 1.2.9]' in lines
     assert 'Lookupy==0.1' in lines
-    assert 'itsdangerous==0.23' not in lines
+    assert 'itsdangerous==0.24' not in lines
 
 
 def test_render_tree_list_all():
     tree_str = render_tree(tree, list_all=True)
     lines = set(tree_str.split('\n'))
-    assert 'Flask-Script==0.6.6' in lines
-    assert '  - SQLAlchemy [required: >=0.7.3, installed: 0.9.1]' in lines
+    assert 'Flask-Script==2.0.6' in lines
+    assert '  - SQLAlchemy [required: >=0.7.6, installed: 1.2.9]' in lines
     assert 'Lookupy==0.1' in lines
-    assert 'itsdangerous==0.23' in lines
+    assert 'itsdangerous==0.24' in lines
+
+
+def test_render_tree_exclude():
+    tree_str = render_tree(tree, list_all=True, exclude={'itsdangerous', 'SQLAlchemy', 'Flask', 'markupsafe', 'wheel'})
+    expected = """alembic==0.9.10
+  - Mako [required: Any, installed: 1.0.7]
+  - python-dateutil [required: Any, installed: 2.7.3]
+    - six [required: >=1.5, installed: 1.11.0]
+  - python-editor [required: >=0.3, installed: 1.0.3]
+click==6.7
+Flask-Script==2.0.6
+gnureadline==6.3.8
+Jinja2==2.10
+Lookupy==0.1
+Mako==1.0.7
+psycopg2==2.7.5
+python-dateutil==2.7.3
+  - six [required: >=1.5, installed: 1.11.0]
+python-editor==1.0.3
+redis==2.10.6
+six==1.11.0
+slugify==0.0.1
+Werkzeug==0.14.1"""
+    assert expected == tree_str
+
+
+def test_render_tree_exclude_reverse():
+    rtree = reverse_tree(tree)
+    tree_str = render_tree(rtree, list_all=True, exclude={'itsdangerous', 'SQLAlchemy', 'Flask', 'markupsafe', 'wheel'})
+    expected = """alembic==0.9.10
+click==6.7
+Flask-Script==2.0.6
+gnureadline==6.3.8
+Jinja2==2.10
+Lookupy==0.1
+Mako==1.0.7
+  - alembic==0.9.10 [requires: Mako]
+psycopg2==2.7.5
+python-dateutil==2.7.3
+  - alembic==0.9.10 [requires: python-dateutil]
+python-editor==1.0.3
+  - alembic==0.9.10 [requires: python-editor>=0.3]
+redis==2.10.6
+six==1.11.0
+  - python-dateutil==2.7.3 [requires: six>=1.5]
+    - alembic==0.9.10 [requires: python-dateutil]
+slugify==0.0.1
+Werkzeug==0.14.1"""
+    assert expected == tree_str
 
 
 def test_render_tree_freeze():
@@ -132,15 +183,15 @@ def test_render_tree_freeze():
         line = line.replace('origin/master', 'master')
         line = line.replace('origin/HEAD', 'master')
         lines.add(line)
-    assert 'Flask-Script==0.6.6' in lines
-    assert '  SQLAlchemy==0.9.1' in lines
+    assert 'Flask-Script==2.0.6' in lines
+    assert '  SQLAlchemy==1.2.9' in lines
     # TODO! Fix the following failing test
     # assert '-e git+https://github.com/naiquevin/lookupy.git@cdbe30c160e1c29802df75e145ea4ad903c05386#egg=Lookupy-master' in lines
-    assert 'itsdangerous==0.23' not in lines
+    assert 'itsdangerous==0.24' not in lines
 
 
 def test_render_json(capsys):
-    output = jsonify_tree(tree, indent=4)
+    output = render_json(tree, indent=4)
     print_graphviz(output)
     out, _ = capsys.readouterr()
     assert out.startswith('[\n    {\n        "')
@@ -148,6 +199,35 @@ def test_render_json(capsys):
     data = json.loads(out)
     assert 'package' in data[0]
     assert 'dependencies' in data[0]
+
+
+def test_render_json_tree():
+    output = render_json_tree(tree, indent=4)
+    data = json.loads(output)
+
+    # @TODO: This test fails on travis because gnureadline doesn't
+    # appear as a dependency of ipython (which it is)
+    #
+    # ignored_pkgs = {'pip', 'pipdeptree', 'setuptools', 'wheel'}
+    # pkg_keys = set([d['key'].lower() for d in data
+    #                 if d['key'].lower() not in ignored_pkgs])
+    # expected = {'alembic', 'flask-script', 'ipython',
+    #             'lookupy', 'psycopg2', 'redis', 'slugify'}
+    # assert pkg_keys - expected == set()
+
+    matching_pkgs = [p for p in data if p['key'] == 'flask-script']
+    assert matching_pkgs
+    flask_script = matching_pkgs[0]
+
+    matching_pkgs = [p for p in flask_script['dependencies'] if p['key'] == 'flask']
+    assert matching_pkgs
+    flask = matching_pkgs[0]
+
+    matching_pkgs = [p for p in flask['dependencies'] if p['key'] == 'jinja2']
+    assert matching_pkgs
+    jinja2 = matching_pkgs[0]
+
+    assert [p for p in jinja2['dependencies'] if p['key'] == 'markupsafe']
 
 
 def test_render_pdf():
@@ -197,6 +277,14 @@ def test_parser_json():
     parser = get_parser()
     args = parser.parse_args(['--json'])
     assert args.json
+    assert args.output_format is None
+
+
+def test_parser_json_tree():
+    parser = get_parser()
+    args = parser.parse_args(['--json-tree'])
+    assert args.json_tree
+    assert not args.json
     assert args.output_format is None
 
 
@@ -261,3 +349,37 @@ def test_conflicting_deps():
         flask: [jinja],
         uritemplate: [simplejson],
     }
+
+
+def test_main_basic(monkeypatch):
+    parser = get_parser()
+    args = parser.parse_args('')
+
+    def _get_args():
+        return args
+    monkeypatch.setattr('pipdeptree._get_args', _get_args)
+
+    assert main() == 0
+
+
+def test_main_show_only_and_exclude_ok(monkeypatch):
+    parser = get_parser()
+    args = parser.parse_args('--packages Flask --exclude Jinja2'.split())
+
+    def _get_args():
+        return args
+    monkeypatch.setattr('pipdeptree._get_args', _get_args)
+
+    assert main() == 0
+
+
+def test_main_show_only_and_exclude_fails(monkeypatch):
+    parser = get_parser()
+    args = parser.parse_args('--packages Flask --exclude Jinja2,Flask'.split())
+
+    def _get_args():
+        return args
+    monkeypatch.setattr('pipdeptree._get_args', _get_args)
+
+    with pytest.raises(SystemExit):
+        main()

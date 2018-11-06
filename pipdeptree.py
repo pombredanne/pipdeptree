@@ -13,13 +13,18 @@ try:
 except ImportError:
     from ordereddict import OrderedDict
 
-import pip
+try:
+    from pip._internal.utils.misc import get_installed_distributions
+    from pip._internal.operations.freeze import FrozenRequirement
+except ImportError:
+    from pip import get_installed_distributions, FrozenRequirement
+
 import pkg_resources
 # inline:
 # from graphviz import backend, Digraph
 
 
-__version__ = '0.10.1'
+__version__ = '0.13.1'
 
 
 flatten = chain.from_iterable
@@ -151,7 +156,7 @@ class Package(object):
 
     @staticmethod
     def frozen_repr(obj):
-        fr = pip.FrozenRequirement.from_dist(obj, [])
+        fr = FrozenRequirement.from_dist(obj, [])
         return str(fr).strip()
 
     def __getattr__(self, key):
@@ -232,7 +237,7 @@ class ReqPackage(Package):
 
     @property
     def version_spec(self):
-        specs = self._obj.specs
+        specs = sorted(self._obj.specs, reverse=True)  # `reverse` makes '>' prior to '<'
         return ','.join([''.join(sp) for sp in specs]) if specs else None
 
     @property
@@ -275,8 +280,8 @@ class ReqPackage(Package):
                 'required_version': self.version_spec}
 
 
-def render_tree(tree, list_all=True, show_only=None, frozen=False):
-    """Convert to tree to string representation
+def render_tree(tree, list_all=True, show_only=None, frozen=False, exclude=None):
+    """Convert tree to string representation
 
     :param dict tree: the package tree
     :param bool list_all: whether to list all the pgks at the root
@@ -286,6 +291,8 @@ def render_tree(tree, list_all=True, show_only=None, frozen=False):
                           output. This is optional arg, default: None.
     :param bool frozen: whether or not show the names of the pkgs in
                         the output that's favourable to pip --freeze
+    :param set exclude: set of select packages to be excluded from the
+                          output. This is optional arg, default: None.
     :returns: string representation of the tree
     :rtype: str
 
@@ -305,6 +312,8 @@ def render_tree(tree, list_all=True, show_only=None, frozen=False):
         nodes = [p for p in nodes if p.key not in branch_keys]
 
     def aux(node, parent=None, indent=0, chain=None):
+        if exclude and (node.key in exclude or node.project_name in exclude):
+            return []
         if chain is None:
             chain = [node.project_name]
         node_str = node.render(parent, frozen)
@@ -323,8 +332,8 @@ def render_tree(tree, list_all=True, show_only=None, frozen=False):
     return '\n'.join(lines)
 
 
-def jsonify_tree(tree, indent):
-    """Converts the tree into json representation.
+def render_json(tree, indent):
+    """Converts the tree into a flat json representation.
 
     The json repr will be a list of hashes, each hash having 2 fields:
       - package
@@ -340,6 +349,49 @@ def jsonify_tree(tree, indent):
                         'dependencies': [v.as_dict() for v in vs]}
                        for k, vs in tree.items()],
                       indent=indent)
+
+
+def render_json_tree(tree, indent):
+    """Converts the tree into a nested json representation.
+
+    The json repr will be a list of hashes, each hash having the following fields:
+      - package_name
+      - key
+      - required_version
+      - installed_version
+      - dependencies: list of dependencies
+
+    :param dict tree: dependency tree
+    :param int indent: no. of spaces to indent json
+    :returns: json representation of the tree
+    :rtype: str
+
+    """
+    tree = sorted_tree(tree)
+    branch_keys = set(r.key for r in flatten(tree.values()))
+    nodes = [p for p in tree.keys() if p.key not in branch_keys]
+    key_tree = dict((k.key, v) for k, v in tree.items())
+    get_children = lambda n: key_tree.get(n.key, [])
+
+    def aux(node, parent=None, chain=None):
+        if chain is None:
+            chain = [node.project_name]
+
+        d = node.as_dict()
+        if parent:
+            d['required_version'] = node.version_spec if node.version_spec else 'Any'
+        else:
+            d['required_version'] = d['installed_version']
+
+        d['dependencies'] = [
+            aux(c, parent=node, chain=chain+[c.project_name])
+            for c in get_children(node)
+            if c.project_name not in chain
+        ]
+
+        return d
+
+    return json.dumps([aux(p) for p in nodes], indent=indent)
 
 
 def dump_graphviz(tree, output_format='dot'):
@@ -479,11 +531,22 @@ def get_parser():
                             'Comma separated list of select packages to show '
                             'in the output. If set, --all will be ignored.'
                         ))
+    parser.add_argument('-e', '--exclude',
+                        help=(
+                            'Comma separated list of select packages to exclude '
+                            'from the output. If set, --all will be ignored.'
+                        ), metavar='PACKAGES')
     parser.add_argument('-j', '--json', action='store_true', default=False,
                         help=(
                             'Display dependency tree as json. This will yield '
                             '"raw" output that may be used by external tools. '
                             'This option overrides all other options.'
+                        ))
+    parser.add_argument('--json-tree', action='store_true', default=False,
+                        help=(
+                            'Display dependency tree as json which is nested '
+                            'the same way as the plain text output printed by default. '
+                            'This option overrides all other options (except --json).'
                         ))
     parser.add_argument('--graph-output', dest='output_format',
                         help=(
@@ -494,18 +557,24 @@ def get_parser():
     return parser
 
 
-def main():
+def _get_args():
     parser = get_parser()
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    pkgs = pip.get_installed_distributions(local_only=args.local_only,
-                                           user_only=args.user_only)
+
+def main():
+    args = _get_args()
+    pkgs = get_installed_distributions(local_only=args.local_only,
+                                       user_only=args.user_only)
 
     dist_index = build_dist_index(pkgs)
     tree = construct_tree(dist_index)
 
     if args.json:
-        print(jsonify_tree(tree, indent=4))
+        print(render_json(tree, indent=4))
+        return 0
+    elif args.json_tree:
+        print(render_json_tree(tree, indent=4))
         return 0
     elif args.output_format:
         output = dump_graphviz(tree, output_format=args.output_format)
@@ -543,10 +612,15 @@ def main():
             return_code = 1
 
     show_only = set(args.packages.split(',')) if args.packages else None
+    exclude = set(args.exclude.split(',')) if args.exclude else None
+
+    if show_only and exclude and (show_only & exclude):
+        print('Conflicting packages found in --packages and --exclude lists.', file=sys.stderr)
+        sys.exit(1)
 
     tree = render_tree(tree if not args.reverse else reverse_tree(tree),
                        list_all=args.all, show_only=show_only,
-                       frozen=args.freeze)
+                       frozen=args.freeze, exclude=exclude)
     print(tree)
     return return_code
 
